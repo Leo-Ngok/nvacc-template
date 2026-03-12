@@ -1,3 +1,5 @@
+//SPDX-License-Identifier: GPL-2.0
+
 // salloc -p h01 -N2 -n2 mpirun -np 2 ./diy_bw
 // mpicc diy_bw.c -O3 -libverbs -o diy_bw
 #include <stdio.h>

@@ -1,3 +1,5 @@
+//SPDX-License-Identifier: GPL-2.0
+
 /*
 nvcc test_vmm_handle.cu -o test_vmm_handle \
 -std=c++20 -O3 \

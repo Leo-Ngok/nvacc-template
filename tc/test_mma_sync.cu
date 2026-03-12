@@ -1,3 +1,5 @@
+//SPDX-License-Identifier: GPL-2.0
+
 // nvcc test_tc_mma_sync.cu -O3 -gencode arch=compute_90a,code=sm_90a -o test_tc_mma_sync
 // srun -n1 -p h01 --gres=gpu:1 ./test_tc_mma_sync
 #include <iostream>

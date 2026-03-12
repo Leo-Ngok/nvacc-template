@@ -1,3 +1,5 @@
+//SPDX-License-Identifier: GPL-2.0
+
 // salloc -p a01 -N2 -n2 mpirun -np 2 ./test_verbs_device
 
 /* 
@@ -175,6 +177,3 @@ int main(int argc, char** argv) {
     CUDART_CHECK(cudaFree(buf_d));
     return 0;
 }
-
-// /rmprog/slurm/v24.05.1/bin/salloc -p a01 -N2 -n2 mpirun -np 2 --mca pml ob1 --mca btl tcp,self ./mpi_rdma
-// mpicc -O3 mpi-rdma.c -o mpi_rdma -libverbs

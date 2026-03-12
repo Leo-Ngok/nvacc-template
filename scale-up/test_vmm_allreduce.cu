@@ -1,3 +1,5 @@
+//SPDX-License-Identifier: GPL-2.0
+
 /*
 nvcc test_vmm_allreduce.cu -o test_vmm_allreduce \
 -gencode arch=compute_90,code=sm_90 -std=c++20 -O3 \

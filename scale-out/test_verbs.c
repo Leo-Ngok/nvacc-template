@@ -1,3 +1,5 @@
+//SPDX-License-Identifier: GPL-2.0
+
 // mpicc -O3 test_verbs.c -o test_verbs -libverbs
 // salloc -p h01 -N2 -n2 mpirun -np 2 ./test_verbs
 #include <stdio.h>

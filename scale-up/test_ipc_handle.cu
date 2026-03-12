@@ -1,3 +1,5 @@
+//SPDX-License-Identifier: GPL-2.0
+
 /*
 nvcc test_ipc_handle.cu -o test_ipc_handle \
 -std=c++20 -O3 \
