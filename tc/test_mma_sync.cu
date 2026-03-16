@@ -119,10 +119,6 @@ bool check(size_t n, float *expected, float *actual) {
 }
 
 int main(int argc, char **argv) {
-    // 1. Test mma.sync
-    // test for m16n8k16
-    // 2. Test wgmma.async.sync
-
     srand(time(0));
 
     float *A_h, *A_d, *B_h, *B_d, *C1_h, *C2_h, *C1_d, *C2_d;
