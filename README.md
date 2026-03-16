@@ -6,9 +6,10 @@ Each file in the code base is independent, so you can compile and use each alone
 
 ## copy
 
-[TODO]
+This part illustrates asynchronous copy and the use of tensor memory accelerators.
 
-This part is under construction. This illustrates asynchronous copy and the use of tensor memory accelerators.
+- `cp.async`. Asynchronous copy for **16B** chunk. Use `commit_group` and `wait_group` for synchronization afterwards.
+- `cp.async.bulk`. Asynchronous copy using Tensor Memory Accelerator. Use cluster level barrier (`mbarrier`) to record number of bytes transmitted and `try_wait` for synchronization. The example included does not exercise empty barrier between producer and consumer, but one may do it by referring to the transaction barrier implemented.
 
 ## tc
 
@@ -17,10 +18,14 @@ This part contains examples of tensor core matrix multiply add (mma) instruction
 This part contains examples of the following mma instructions:
 
 - `mma.sync`. This requires SM 8.0 (Ampere) or later.
-- [TODO] `wgmma.mma_async.sync.aligned`. This requires SM 9.0 (Hopper) 
+- `wgmma.mma_async.sync.aligned`. This requires SM 9.0 (Hopper) 
 - [TODO] `tcgen05`. This requires SM 10.0 (Blackwell)
 
 One can evaluate the indexing logic illustrated by the kernel implementations first. Quickly nesting the logics into tiles and blocks and loops, and sometimes consider swizzling can be confusing for starters.
+
+NOTE: One may consider to extract the part for loading operands to (registers for `mma.sync`) or (shared memory for `wgmma` SS mode) to have a deeper understanding about the indexing logic, before using the high level CUTLASS / CuTe templates.
+
+[This part is (partly) inspired by gau-nernst's blog and implementation. For more details, please refer <https://gau-nernst.github.io/>]
 
 ## scale-up
 

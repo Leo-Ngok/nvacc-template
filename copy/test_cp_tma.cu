@@ -132,6 +132,7 @@ void gemm_cp_tma_bf16_krnl(size_t m, size_t n, size_t k, float *C , const __nv_b
     __asm__ __volatile__("cp.async.wait_group 0;");
     tmap_A_handle;
 #elif CP_VER == 4
+    // Warning: You should also read for cluster "empty" barrier for "consumer" synchronization for new loading available.
     __shared__ uint64_t producer_barrier_handle;
     uint32_t producer_bar_ptr = (uint32_t) __cvta_generic_to_shared(&producer_barrier_handle);
     if(tid == 0) {
@@ -196,9 +197,7 @@ void gemm_cp_tma_bf16_krnl(size_t m, size_t n, size_t k, float *C , const __nv_b
 }
 
 void gemm_cp_tma_bf16(size_t m, size_t n, size_t k, float *C , const nv_bfloat16 *A, nv_bfloat16 *B) {
-    // cudaTensorMapEncodeTiled()
-    CUtensorMap tmap_a;
-    // cuTensorMapEncodeTiled(&tmap_a, );
+        CUtensorMap tmap_a;
     // Major first.
     cuuint64_t globalDim[2] = {k, m};
     cuuint64_t globalStrides[1] = {k * sizeof(nv_bfloat16)};
