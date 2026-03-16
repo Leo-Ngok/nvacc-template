@@ -119,13 +119,13 @@ void gemm_wgmma_bf16_krnl(size_t m, size_t n, size_t k, float *C , const __nv_bf
         size_t start_idx = it;
         size_t _i = start_idx / k; 
         size_t _k = start_idx % k; 
-        sA[( (_k / CORE_MAT_COLS) * 512 ) + (_i * CORE_MAT_COLS) + (_k % CORE_MAT_COLS)] = A[_i * k + _k];
+        sA[( (_k / CORE_MAT_COLS) * (BLOCK_M * CORE_MAT_COLS) ) + (_i * CORE_MAT_COLS) + (_k % CORE_MAT_COLS)] = A[_i * k + _k];
     }
     for(auto it = tid; it < (n * k); it += threads_per_block) {
         size_t start_idx = it;
-        size_t _i = start_idx / k; 
+        size_t _j = start_idx / k; 
         size_t _k = start_idx % k; 
-        sB[( (_k / CORE_MAT_COLS) * 512 ) + (_i * CORE_MAT_COLS) + (_k % CORE_MAT_COLS)] = B[_i * k + _k];
+        sB[( (_k / CORE_MAT_COLS) * (BLOCK_N * CORE_MAT_COLS) ) + (_j * CORE_MAT_COLS) + (_k % CORE_MAT_COLS)] = B[_j * k + _k];
     }
     __syncthreads();
     
