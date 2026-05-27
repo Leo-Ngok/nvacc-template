@@ -2,7 +2,7 @@
 
 // nvcc test_cp_sync.cu -O3 -gencode arch=compute_90a,code=sm_90a -o test_cp_sync
 // srun -n1 -p h01 --gres=gpu:1 ./test_cp_sync
-#include <iostream>
+#include <cstdio>
 #include <cuda_bf16.h>
 #include <ctime>
 #include <cstdlib>

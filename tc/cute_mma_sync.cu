@@ -1,13 +1,18 @@
 //SPDX-License-Identifier: GPL-2.0
 
-// nvcc test_mma_sync.cu -O3 -gencode arch=compute_90a,code=sm_90a -o test_mma_sync
-// srun -n1 -p h01 --gres=gpu:1 ./test_mma_sync
+// nvcc cute_mma_sync.cu -O3 -std=c++17 -I/home/fit/zhaijdyzq/repos/DeepGEMM/third-party/cutlass/include -I/home/fit/zhaijdyzq/repos/DeepGEMM/third-party/cutlass/tools/util/include -gencode arch=compute_90a,code=sm_90a -o cute_mma_sync
+// srun -n1 -p h01 --gres=gpu:1 ./cute_mma_sync
+#include "cute/arch/mma_sm80.hpp"
+#include "cute/numeric/numeric_types.hpp"
+#include "cute/pointer.hpp"
 #include <cstdio>
 #include <cuda_bf16.h>
 #include <ctime>
 #include <cstdlib>
 #include <cuda_runtime.h>
 #include <cfloat>
+#include <cute/tensor.hpp>
+
 
 #define CUDART_CHECK(status) \
     do {\
@@ -48,7 +53,6 @@ void gemm_mma_sync_bf16_krnl(size_t m, size_t n, size_t k, float *C , const __nv
     // assert m == k ==16, n == 8
     __nv_bfloat16 rA[16 * 16 / 32];
     __nv_bfloat16 rB[16 * 8 / 32];
-    float rC[16 * 8 / 32] = {0};
     constexpr int stride_a = 16;
     constexpr int stride_b = 16;
     constexpr int stride_c = 8;
@@ -69,26 +73,34 @@ void gemm_mma_sync_bf16_krnl(size_t m, size_t n, size_t k, float *C , const __nv
     rB[2] = B[(i1    ) * stride_b + (j1 + 8)];
     rB[3] = B[(i1    ) * stride_b + (j1 + 9)];
 
+    
+    auto tiled_mma = cute::make_tiled_mma(
+        cute::SM80_16x8x16_F32BF16BF16F32_TN{}
+    );
+    auto thr_mma = tiled_mma.get_slice(threadIdx.x);
+    using tCrALayout = decltype(
+        thr_mma.partition_fragment_A(
+            cute::make_tensor(cute::make_rmem_ptr<cute::bfloat16_t>((const void *) nullptr),
+            cute::Shape<cute::Int<16>, cute::Int<16>>{})
+        ).layout()
+    );
+    auto tCrA = cute::make_tensor(cute::make_rmem_ptr(reinterpret_cast<cute::bfloat16_t *>(rA)), tCrALayout{});
+    using tCrBLayout = decltype(
+        thr_mma.partition_fragment_B(
+            cute::make_tensor(cute::make_rmem_ptr<cute::bfloat16_t>((const void *) nullptr),
+            cute::Shape<cute::Int<8>, cute::Int<16>>{})
+        ).layout()
+    );
+    auto tCrB = cute::make_tensor(cute::make_rmem_ptr(reinterpret_cast<cute::bfloat16_t *>(rB)), tCrBLayout{});
+    auto tCrC = cute::partition_fragment_C(tiled_mma, 
+        cute::Shape<cute::Int<16>, cute::Int<8>>{});
 
-    auto rAu = reinterpret_cast<const uint32_t *>(rA);
-    auto rBu = reinterpret_cast<const uint32_t *>(rB);
-
-    auto D = rC;
-    __asm__ __volatile__(
-        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-        "{%0, %1, %2, %3}, "    // D
-        "{%4, %5, %6, %7}, "    // A
-        "{%8, %9}, "            // B
-        "{%10, %11, %12, %13};" // C
-    : "=f"(D[0]), "=f"(D[1]), "=f"(D[2]), "=f"(D[3])
-    : "r"(rAu[0]), "r"(rAu[1]), "r"(rAu[2]), "r"(rAu[3]),
-    "r"(rBu[0]), "r"(rBu[1]),
-    "f"(D[0]), "f"(D[1]), "f"(D[2]), "f"(D[3]));
-
-    C[(i1    ) * stride_c + (j1    )] = rC[0];
-    C[(i1    ) * stride_c + (j1 + 1)] = rC[1];
-    C[(i1 + 8) * stride_c + (j1    )] = rC[2];
-    C[(i1 + 8) * stride_c + (j1 + 1)] = rC[3];
+    cute::gemm(tiled_mma, tCrA, tCrB, tCrC);
+    
+    C[(i1    ) * stride_c + (j1    )] = tCrC(0);
+    C[(i1    ) * stride_c + (j1 + 1)] = tCrC(1);
+    C[(i1 + 8) * stride_c + (j1    )] = tCrC(2);
+    C[(i1 + 8) * stride_c + (j1 + 1)] = tCrC(3);
 }
 
 __global__
