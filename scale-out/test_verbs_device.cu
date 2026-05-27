@@ -1,9 +1,9 @@
 //SPDX-License-Identifier: GPL-2.0
 
-// salloc -p a01 -N2 -n2 mpirun -np 2 ./test_verbs_device
+// salloc -p a01 -N2 -n2 --gres=gpu:1 mpirun -np 2 ./test_verbs_device
 
 /* 
-nvcc test_verbs_device.cu -o test_verbs_device \ 
+nvcc test_verbs_device.cu -o test_verbs_device \
 -std=c++20 \
 -I$(mpicxx -showme:incdirs) \
 -L$(mpicxx -showme:libdirs) \
@@ -79,7 +79,7 @@ int main(int argc, char** argv) {
     // Create Queue Pair (RC - Reliable Connection)
     ibv_srq_init_attr srq_attr = {
         .attr = {
-            .max_sge = 1, .max_wr = 1, .srq_limit = 1
+            .max_wr = 1,.max_sge = 1,  .srq_limit = 1,
         }
     };
     auto srq = ibv_create_srq(pd, &srq_attr);

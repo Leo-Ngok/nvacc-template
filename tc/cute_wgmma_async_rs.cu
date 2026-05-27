@@ -1,13 +1,14 @@
 //SPDX-License-Identifier: GPL-2.0
 
-// nvcc test_wgmma_async.cu -O3 -gencode arch=compute_90a,code=sm_90a -o test_wgmma_async
-// srun -n1 -p h01 --gres=gpu:1 ./test_wgmma_async
+// nvcc test_wgmma_async_rs.cu -O3 -gencode arch=compute_90a,code=sm_90a -o test_wgmma_async_rs
+// srun -n1 -p h01 --gres=gpu:1 ./test_wgmma_async_rs
 #include <iostream>
 #include <cuda_bf16.h>
 #include <ctime>
 #include <cstdlib>
 #include <cuda_runtime.h>
 #include <cfloat>
+#include <cute/tensor.hpp>
 
 #define CUDART_CHECK(status) \
     do {\
@@ -46,6 +47,12 @@ void fill_seq(float *buf, size_t n) {
     for(size_t i = 0; i < n; i++) {
         buf[i] = ((float)i) * 0.5;
     }
+}
+
+template<int CORE_MAT_COLS, int STRIDE_BLOCK_DIM>
+__forceinline__ __device__
+int smem_pos(int i, int j) {
+    return ( (j / CORE_MAT_COLS) * (STRIDE_BLOCK_DIM * CORE_MAT_COLS) ) + (i * CORE_MAT_COLS) + (j % CORE_MAT_COLS);
 }
 
 // Before diving into krnl impl, read the following first:
@@ -99,7 +106,20 @@ void gemm_wgmma_bf16_krnl(size_t m, size_t n, size_t k, float *C , const __nv_bf
     constexpr int CORE_MAT_COLS = 16 / sizeof(nv_bfloat16);
     alignas(128) __shared__ nv_bfloat16 sA[BLOCK_M * BLOCK_K];
     alignas(128) __shared__ nv_bfloat16 sB[BLOCK_M * BLOCK_K];
-    
+    float rC[MMA_M * MMA_N / 128] = {0};
+    uint64_t desc_a = 0, desc_b = 0;
+    // smem descriptor
+
+    desc_a |= ((uint16_t) __cvta_generic_to_shared(sA)) >> 4;
+    desc_a |= ((/*bM*/BLOCK_M * 16) >> 4) << 16; // LBO
+    desc_a |= ((8ULL * 16) >> 4) << 32; // SBO Note that a core matrix must be size of 8 x 16B.
+    // Base offset: 0 do nothing
+    // layout type: 0 do nothing
+
+    desc_b |= ((uint16_t) __cvta_generic_to_shared(sB)) >> 4;
+    desc_b |= ((/*bN*/BLOCK_N * 16) >> 4) << 16; 
+    desc_b |= ((8ULL * 16) >> 4) << 32; 
+
     size_t threads_per_block = blockDim.x * blockDim.y;
 
     for(auto it = tid; it < (m * k); it += threads_per_block) {
@@ -115,36 +135,37 @@ void gemm_wgmma_bf16_krnl(size_t m, size_t n, size_t k, float *C , const __nv_bf
         sB[( (_k / CORE_MAT_COLS) * (BLOCK_N * CORE_MAT_COLS) ) + (_j * CORE_MAT_COLS) + (_k % CORE_MAT_COLS)] = B[_j * k + _k];
     }
     __syncthreads();
+    nv_bfloat16 rA[MMA_M * MMA_K / 128];
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+    int top_left_i = warp_id * 16 + (lane_id / 4);
+    int top_left_k = (lane_id % 4) * 2;
 
-    float rC[MMA_M * MMA_N / 128] = {0};
-    uint64_t desc_a = 0, desc_b = 0;
-    // smem descriptor
-
-    desc_a |= ((uint16_t) __cvta_generic_to_shared(sA)) >> 4;
-    desc_a |= ((/*bM*/BLOCK_M * 16) >> 4) << 16; // LBO
-    desc_a |= ((8ULL * 16) >> 4) << 32; // SBO Note that a core matrix must be size of 8 x 16B.
-    // Base offset: 0 do nothing
-    // layout type: 0 do nothing
-
-    desc_b |= ((uint16_t) __cvta_generic_to_shared(sB)) >> 4;
-    desc_b |= ((/*bN*/BLOCK_N * 16) >> 4) << 16; 
-    desc_b |= ((8ULL * 16) >> 4) << 32; 
+    rA[0] = sA[smem_pos<CORE_MAT_COLS, BLOCK_M>(top_left_i, top_left_k    )];
+    rA[1] = sA[smem_pos<CORE_MAT_COLS, BLOCK_M>(top_left_i, top_left_k + 1)];
+    rA[2] = sA[smem_pos<CORE_MAT_COLS, BLOCK_M>(top_left_i + 8, top_left_k    )];
+    rA[3] = sA[smem_pos<CORE_MAT_COLS, BLOCK_M>(top_left_i + 8, top_left_k + 1)];
+    rA[4] = sA[smem_pos<CORE_MAT_COLS, BLOCK_M>(top_left_i, top_left_k + 8)];
+    rA[5] = sA[smem_pos<CORE_MAT_COLS, BLOCK_M>(top_left_i, top_left_k + 9)];
+    rA[6] = sA[smem_pos<CORE_MAT_COLS, BLOCK_M>(top_left_i + 8, top_left_k + 8)];
+    rA[7] = sA[smem_pos<CORE_MAT_COLS, BLOCK_M>(top_left_i + 8, top_left_k + 9)];
+    uint32_t *rAu = reinterpret_cast<uint32_t *>(rA);
     for(int t = 0; t < 16; t++)
         __asm__ __volatile__("" : "+f"(rC[t]) :: "memory");
     // wg arrive
     __asm__ __volatile__("wgmma.fence.sync.aligned;\n" ::: "memory");
     // m64n64k16 BF16 to F32
     __asm__ __volatile__ (
-      ".reg .pred p;\n"
-      "setp.ne.b32 p, %34, 0;\n"
+      "{\n .reg .pred p;\n"
+      "setp.ne.b32 p, %37, 0;\n"
         "wgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 "
         "{%0,  %1,  %2,  %3,  %4,  %5,  %6,  %7,  "
         " %8,  %9,  %10, %11, %12, %13, %14, %15, "
         " %16,  %17,  %18,  %19,  %20,  %21,  %22,  %23,  "
         " %24,  %25,  %26,  %27,  %28,  %29,  %30,  %31},  "
-        "%32, %33, p, 1, 1, 0, 0;" 
+        "{%32, %33, %34, %35}, %36, p, 1, 1, 0; \n}\n" 
         /* scale-d = p (=1), imm-scale-a = imm-scale-b = 1 (can be -1), 
-        imm-trans-a = imm-trans-b = 0 */
+        imm-trans-b = 0 (no trans-a coz it is in register already)*/
         // trans 0 = k-major
         // trans 1 = m/n-major
         // set imm-trans-b to be 1 if B is no transpose
@@ -157,7 +178,7 @@ void gemm_wgmma_bf16_krnl(size_t m, size_t n, size_t k, float *C , const __nv_bf
           "+f"(rC[20]), "+f"(rC[21]), "+f"(rC[22]), "+f"(rC[23]),
           "+f"(rC[24]), "+f"(rC[25]), "+f"(rC[26]), "+f"(rC[27]),
           "+f"(rC[28]), "+f"(rC[29]), "+f"(rC[30]), "+f"(rC[31])
-        : "l"(desc_a), "l"(desc_b), "r"(1));
+        :  "r"(rAu[0]),  "r"(rAu[1]),  "r"(rAu[2]),  "r"(rAu[3]), "l"(desc_b), "r"(1));
     
     // wg commit
     __asm__ __volatile__("wgmma.commit_group.sync.aligned;\n" ::: "memory");
