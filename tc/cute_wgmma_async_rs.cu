@@ -1,8 +1,8 @@
 //SPDX-License-Identifier: GPL-2.0
 
-// nvcc test_wgmma_async_rs.cu -O3 -gencode arch=compute_90a,code=sm_90a -o test_wgmma_async_rs
-// srun -n1 -p h01 --gres=gpu:1 ./test_wgmma_async_rs
-#include <iostream>
+// nvcc cute_wgmma_async_rs.cu -O3 -std=c++17 -I/home/fit/zhaijdyzq/repos/DeepGEMM/third-party/cutlass/include -I/home/fit/zhaijdyzq/repos/DeepGEMM/third-party/cutlass/tools/util/include -gencode arch=compute_90a,code=sm_90a -o cute_wgmma_async_rs
+// srun -n1 -p h01 --gres=gpu:1 ./cute_wgmma_async_rs
+#include <cstdio>
 #include <cuda_bf16.h>
 #include <ctime>
 #include <cstdlib>
@@ -55,48 +55,6 @@ int smem_pos(int i, int j) {
     return ( (j / CORE_MAT_COLS) * (STRIDE_BLOCK_DIM * CORE_MAT_COLS) ) + (i * CORE_MAT_COLS) + (j % CORE_MAT_COLS);
 }
 
-// Before diving into krnl impl, read the following first:
-// smem descriptor
-// [0, 14): start smem addr, byte address / 16
-
-// (K Major) For N: This is the stride from the first col to the second col of the 8x2 brick in INTERLEAVED
-//   Unused for all SWIZZLE_* layouts (and assumed to be 1)
-// [16, 30): LBO, / 16
-
-// (K-Major) For N: This is the stride from the first 8 rows to the next 8 rows.
-// [32, 46): SBO
-
-// [49, 52): Base offset (swizzle 128b / swizzle 64b)
-// [62, 64): layout type: 0 (no swizzle), 3 (32b), 2 (64b), 1 (128b)
-
-// That is from PTX docs.
-
-/*
-However, it is confusing. Don't try to read PTX doc directly, when you have no idea on tc coordinates.
-Consider the following first:
-1. Assume doing A @ B^T, where A and B are both row-major, or in nv-word, k-major, i.e. C[i][j] += A[i][k] * B[j][k];
-2. wgmma operands must be from (A: reg or smem) and (B: smem only)
-3. wgmma instructions MUST be MxNxK = 64xNx"32B"
-4. The "32B" part means 32 / sizeof(T) elements for dtype T.
-5. A core matrix is a 8 x 16B "sub-matrix".
-6. Since wgmma is 64 x N x 32B, the core matrix grid for A must be ((64 / 8) x (32 / 16)) = (8 x 2)
-7. Core matrix grid for B is (N/8 x 2)
-8. Adjacent core matrices in a column of the core matrix grid must be contiguous.
-9. Elements inside a core matrix are also contiguous.
-   - Run the code below and read the coordinate mapping of A, assume you do 64 x 64 x 16 with dtype as fp16/bf16:
-
-def convert(i: int, k: int):
-    idx = ((k // 8) * 512) + (i * 8) + (k % 8)
-    return idx
-for i in range(128):
-    for k in range(16):
-        print(f'{converti, k):03d} ', end='')
-    print()
-
-10. If you want to cascade multiple wgmma window, then you add to sA (sB) MMA_M * MMA_K (* sizeof(T))
-11. You may want to consider using TMA to load to Smem. Then you may want to use 3D TMA descriptor
-12. This version does NOT consider swizzling. If you want to do so, understand the non-swizzled version first.
-*/
 __global__
 void gemm_wgmma_bf16_krnl(size_t m, size_t n, size_t k, float *C , const __nv_bfloat16 *A, __nv_bfloat16 *B) {
     // 64 X 64 X 16
@@ -106,19 +64,6 @@ void gemm_wgmma_bf16_krnl(size_t m, size_t n, size_t k, float *C , const __nv_bf
     constexpr int CORE_MAT_COLS = 16 / sizeof(nv_bfloat16);
     alignas(128) __shared__ nv_bfloat16 sA[BLOCK_M * BLOCK_K];
     alignas(128) __shared__ nv_bfloat16 sB[BLOCK_M * BLOCK_K];
-    float rC[MMA_M * MMA_N / 128] = {0};
-    uint64_t desc_a = 0, desc_b = 0;
-    // smem descriptor
-
-    desc_a |= ((uint16_t) __cvta_generic_to_shared(sA)) >> 4;
-    desc_a |= ((/*bM*/BLOCK_M * 16) >> 4) << 16; // LBO
-    desc_a |= ((8ULL * 16) >> 4) << 32; // SBO Note that a core matrix must be size of 8 x 16B.
-    // Base offset: 0 do nothing
-    // layout type: 0 do nothing
-
-    desc_b |= ((uint16_t) __cvta_generic_to_shared(sB)) >> 4;
-    desc_b |= ((/*bN*/BLOCK_N * 16) >> 4) << 16; 
-    desc_b |= ((8ULL * 16) >> 4) << 32; 
 
     size_t threads_per_block = blockDim.x * blockDim.y;
 
@@ -135,68 +80,65 @@ void gemm_wgmma_bf16_krnl(size_t m, size_t n, size_t k, float *C , const __nv_bf
         sB[( (_k / CORE_MAT_COLS) * (BLOCK_N * CORE_MAT_COLS) ) + (_j * CORE_MAT_COLS) + (_k % CORE_MAT_COLS)] = B[_j * k + _k];
     }
     __syncthreads();
+
     nv_bfloat16 rA[MMA_M * MMA_K / 128];
     int warp_id = tid / 32;
     int lane_id = tid % 32;
     int top_left_i = warp_id * 16 + (lane_id / 4);
     int top_left_k = (lane_id % 4) * 2;
 
-    rA[0] = sA[smem_pos<CORE_MAT_COLS, BLOCK_M>(top_left_i, top_left_k    )];
-    rA[1] = sA[smem_pos<CORE_MAT_COLS, BLOCK_M>(top_left_i, top_left_k + 1)];
+    rA[0] = sA[smem_pos<CORE_MAT_COLS, BLOCK_M>(top_left_i,     top_left_k    )];
+    rA[1] = sA[smem_pos<CORE_MAT_COLS, BLOCK_M>(top_left_i,     top_left_k + 1)];
     rA[2] = sA[smem_pos<CORE_MAT_COLS, BLOCK_M>(top_left_i + 8, top_left_k    )];
     rA[3] = sA[smem_pos<CORE_MAT_COLS, BLOCK_M>(top_left_i + 8, top_left_k + 1)];
-    rA[4] = sA[smem_pos<CORE_MAT_COLS, BLOCK_M>(top_left_i, top_left_k + 8)];
-    rA[5] = sA[smem_pos<CORE_MAT_COLS, BLOCK_M>(top_left_i, top_left_k + 9)];
+    rA[4] = sA[smem_pos<CORE_MAT_COLS, BLOCK_M>(top_left_i,     top_left_k + 8)];
+    rA[5] = sA[smem_pos<CORE_MAT_COLS, BLOCK_M>(top_left_i,     top_left_k + 9)];
     rA[6] = sA[smem_pos<CORE_MAT_COLS, BLOCK_M>(top_left_i + 8, top_left_k + 8)];
     rA[7] = sA[smem_pos<CORE_MAT_COLS, BLOCK_M>(top_left_i + 8, top_left_k + 9)];
-    uint32_t *rAu = reinterpret_cast<uint32_t *>(rA);
-    for(int t = 0; t < 16; t++)
-        __asm__ __volatile__("" : "+f"(rC[t]) :: "memory");
-    // wg arrive
-    __asm__ __volatile__("wgmma.fence.sync.aligned;\n" ::: "memory");
-    // m64n64k16 BF16 to F32
-    __asm__ __volatile__ (
-      "{\n .reg .pred p;\n"
-      "setp.ne.b32 p, %37, 0;\n"
-        "wgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 "
-        "{%0,  %1,  %2,  %3,  %4,  %5,  %6,  %7,  "
-        " %8,  %9,  %10, %11, %12, %13, %14, %15, "
-        " %16,  %17,  %18,  %19,  %20,  %21,  %22,  %23,  "
-        " %24,  %25,  %26,  %27,  %28,  %29,  %30,  %31},  "
-        "{%32, %33, %34, %35}, %36, p, 1, 1, 0; \n}\n" 
-        /* scale-d = p (=1), imm-scale-a = imm-scale-b = 1 (can be -1), 
-        imm-trans-b = 0 (no trans-a coz it is in register already)*/
-        // trans 0 = k-major
-        // trans 1 = m/n-major
-        // set imm-trans-b to be 1 if B is no transpose
-        // default to row-major * coln-major, or A @ B^T for row major A, B
-        : "+f"(rC[0]),  "+f"(rC[1]),  "+f"(rC[2]),  "+f"(rC[3]),
-          "+f"(rC[4]),  "+f"(rC[5]),  "+f"(rC[6]),  "+f"(rC[7]),
-          "+f"(rC[8]),  "+f"(rC[9]),  "+f"(rC[10]), "+f"(rC[11]),
-          "+f"(rC[12]), "+f"(rC[13]), "+f"(rC[14]), "+f"(rC[15]),
-          "+f"(rC[16]), "+f"(rC[17]), "+f"(rC[18]), "+f"(rC[19]),
-          "+f"(rC[20]), "+f"(rC[21]), "+f"(rC[22]), "+f"(rC[23]),
-          "+f"(rC[24]), "+f"(rC[25]), "+f"(rC[26]), "+f"(rC[27]),
-          "+f"(rC[28]), "+f"(rC[29]), "+f"(rC[30]), "+f"(rC[31])
-        :  "r"(rAu[0]),  "r"(rAu[1]),  "r"(rAu[2]),  "r"(rAu[3]), "l"(desc_b), "r"(1));
-    
-    // wg commit
-    __asm__ __volatile__("wgmma.commit_group.sync.aligned;\n" ::: "memory");
 
-    for(int t = 0; t < 16; t++)
-        __asm__ __volatile__("" : "+f"(rC[t]) :: "memory");
-    // wg wait
-    __asm__ __volatile__("wgmma.wait_group.sync.aligned 0;\n" ::: "memory");
-    // warning: You should add fence to rC when putting it into loop.
+    auto tiled_mma = cute::make_tiled_mma(
+        cute::SM90_64x64x16_F32BF16BF16_RS<cute::SM90::GMMA::Major::K, cute::SM90::GMMA::Major::K>{}
+    );
+    using sBLayout = decltype(cute::tile_to_shape(
+        cute::SM90::GMMA::Layout_K_INTER_Atom<cute::bfloat16_t>{},
+        cute::Shape<cute::Int<MMA_N>, cute::Int<MMA_K>>{}
+    ));
+    auto thr_mma = tiled_mma.get_slice(threadIdx.x);
+    auto _sB = cute::make_tensor(
+        cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(sB)), sBLayout{}
+    );
+    auto tCrB = thr_mma.partition_fragment_B(_sB);
+    auto tCrC = cute::partition_fragment_C(tiled_mma, 
+        cute::Shape<cute::Int<MMA_M>, cute::Int<MMA_N>>{});
+    
+    auto tCrA_layout = thr_mma.partition_fragment_A(
+        cute::make_tensor(cute::make_rmem_ptr<cute::bfloat16_t>((const void *)nullptr), 
+        cute::Shape<cute::Int<MMA_M>, cute::Int<MMA_K>>{})
+    ).layout();
+
+    auto tCrA = cute::make_tensor(cute::make_rmem_ptr(reinterpret_cast<cute::bfloat16_t*>(rA)), tCrA_layout);
+    // uint32_t *rAu = reinterpret_cast<uint32_t *>(rA);
+    // auto tCrA = cute::make_tensor(
+    //     cute::make_rmem_ptr(rAu),
+    //     cute::make_layout(cute::make_shape(cute::Int<4>{}))
+    // );
+    cute::clear(tCrC);
+    cute::warpgroup_fence_operand(tCrC);
+    cute::warpgroup_arrive();
+    // tiled_mma.accumulate_ = cute::GMMA::ScaleOut::Zero;
+    cute::gemm(tiled_mma, tCrA, tCrB, tCrC);
+    cute::warpgroup_commit_batch();
+    cute::warpgroup_wait<0>();
+    cute::warpgroup_fence_operand(tCrC);
     size_t ci = (threadIdx.x / 32) * 16 + ((threadIdx.x % 32) / 4);
     size_t cj = (threadIdx.x % 4) * 2;
     for (int t = 0; t < 8; t++) {
         int _t = t * 4;
         int __t = t * 8;
-        C[(ci    ) * n + (cj + __t + 0)] = rC[_t + 0];
-        C[(ci    ) * n + (cj + __t + 1)] = rC[_t + 1];
-        C[(ci + 8) * n + (cj + __t + 0)] = rC[_t + 2];
-        C[(ci + 8) * n + (cj + __t + 1)] = rC[_t + 3];
+        C[(ci    ) * n + (cj + __t + 0)] = tCrC(_t + 0);
+        C[(ci    ) * n + (cj + __t + 1)] = tCrC(_t + 1);
+        C[(ci + 8) * n + (cj + __t + 0)] = tCrC(_t + 2);
+        C[(ci + 8) * n + (cj + __t + 1)] = tCrC(_t + 3);
     }
 }
 
@@ -260,9 +202,9 @@ int main(int argc, char **argv) {
 
     bool failed = check(M * N, C1_h, C2_h);
     if(failed) {
-        printf("WGMMA ASYNC GeMM Check failed.\n");
+        printf("WGMMA ASYNC (RS) CuTe GeMM Check failed.\n");
     } else {
-        printf("WGMMA ASYNC GeMM Check succeed.\n");
+        printf("WGMMA ASYNC (RS) CuTe GeMM Check succeed.\n");
     }
     CUDART_CHECK(cudaFree(A_d));
     CUDART_CHECK(cudaFree(B_d));

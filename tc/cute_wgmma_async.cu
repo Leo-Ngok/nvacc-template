@@ -1,9 +1,8 @@
 //SPDX-License-Identifier: GPL-2.0
-// nvcc cute_wgmma_async.cu -O3 -std=c++17 -DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED -I/home/fit/zhaijdyzq/repos/DeepGEMM/third-party/cutlass/include -I/home/fit/zhaijdyzq/repos/DeepGEMM/third-party/cutlass/tools/util/include -gencode arch=compute_90a,code=sm_90a -o cute_wgmma_async
-
+// nvcc cute_wgmma_async.cu -O3 -std=c++17 -I/home/fit/zhaijdyzq/repos/DeepGEMM/third-party/cutlass/include -I/home/fit/zhaijdyzq/repos/DeepGEMM/third-party/cutlass/tools/util/include -gencode arch=compute_90a,code=sm_90a -o cute_wgmma_async
+// srun -n1 -p h01 --gres=gpu:1 ./cute_wgmma_async
 #include <cstdio>
 #include <cuda_bf16.h>
-#include <cstdint>
 #include <ctime>
 #include <cstdlib>
 #include <cuda_runtime.h>
@@ -97,7 +96,7 @@ void gemm_wgmma_bf16_krnl(size_t m, size_t n, size_t k, float *C , const __nv_bf
     auto _sB = cute::make_tensor(
         cute::make_smem_ptr(reinterpret_cast<cute::bfloat16_t*>(sB)), sBLayout{}
     );
-    auto tCrB = thr_mma.partition_fragment_A(_sB);
+    auto tCrB = thr_mma.partition_fragment_B(_sB);
     auto tCrC = cute::partition_fragment_C(tiled_mma, cute::Shape<cute::Int<MMA_M>, cute::Int<MMA_N>>{});
     cute::clear(tCrC);
     cute::warpgroup_fence_operand(tCrC);

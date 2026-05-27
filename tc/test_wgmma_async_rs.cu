@@ -2,7 +2,7 @@
 
 // nvcc test_wgmma_async_rs.cu -O3 -gencode arch=compute_90a,code=sm_90a -o test_wgmma_async_rs
 // srun -n1 -p h01 --gres=gpu:1 ./test_wgmma_async_rs
-#include <iostream>
+#include <cstdio>
 #include <cuda_bf16.h>
 #include <ctime>
 #include <cstdlib>
@@ -259,9 +259,9 @@ int main(int argc, char **argv) {
 
     bool failed = check(M * N, C1_h, C2_h);
     if(failed) {
-        printf("WGMMA ASYNC GeMM Check failed.\n");
+        printf("WGMMA ASYNC (RS) GeMM Check failed.\n");
     } else {
-        printf("WGMMA ASYNC GeMM Check succeed.\n");
+        printf("WGMMA ASYNC (RS) GeMM Check succeed.\n");
     }
     CUDART_CHECK(cudaFree(A_d));
     CUDART_CHECK(cudaFree(B_d));
