@@ -1,7 +1,7 @@
 //SPDX-License-Identifier: GPL-2.0
 
-// nvcc test_cp_tma.cu -O3 -gencode arch=compute_90a,code=sm_90a -o test_cp_tma -lcuda
-// srun -n1 -p h01 --gres=gpu:1 ./test_cp_tma
+// vcc cute_cp_tma.cu -O3 -std=c++17 -I/home/fit/zhaijdyzq/repos/DeepGEMM/third-party/cutlass/include -I/home/fit/zhaijdyzq/repos/DeepGEMM/third-party/cutlass/tools/util/include -gencode arch=compute_90a,code=sm_90a -o cute_cp_tma -lcuda
+// srun -n1 -p h01 --gres=gpu:1 ./cute_cp_tma
 #include <cstdio>
 #include <cuda_bf16.h>
 #include <ctime>
@@ -10,8 +10,10 @@
 #include <cfloat>
 #include <cassert>
 #include <cuda.h>
+#include <cute/tensor.hpp>
 
-#define CP_VER 4
+
+#define CP_VER 3
 
 #define CUDART_CHECK(status) \
     do {\
@@ -83,6 +85,10 @@ void gemm_naive_bf16(size_t m, size_t n, size_t k, float *C , const __nv_bfloat1
 __global__
 void gemm_cp_tma_bf16_krnl(size_t m, size_t n, size_t k, float *C , const __nv_bfloat16 *A, __nv_bfloat16 *B,
     const __grid_constant__ CUtensorMap tmap_A_handle) {
+    constexpr int kBlockM = 128;
+    constexpr int kBlockN = 128;
+    constexpr int kBlockK = 64;
+    constexpr int kNThreads = 256;
     size_t i = blockIdx.y * blockDim.y + threadIdx.y;
     size_t j = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -90,7 +96,7 @@ void gemm_cp_tma_bf16_krnl(size_t m, size_t n, size_t k, float *C , const __nv_b
     size_t tid = blockDim.x * threadIdx.y + threadIdx.x;
 
     // to be consistent with main()
-    alignas(128) __shared__ nv_bfloat16 sA[48 * 16];
+    alignas(128) __shared__ nv_bfloat16 sA[kBlockM * kBlockK];
     // __shared__ nv_bfloat16 sB[32 * 16];
     size_t threads_per_block = blockDim.x * blockDim.y;
 
@@ -126,10 +132,32 @@ void gemm_cp_tma_bf16_krnl(size_t m, size_t n, size_t k, float *C , const __nv_b
         __asm__ __volatile__("cp.async.cg.shared.global [%0], [%1], 16;" ::
             "r"((uint32_t)sA_ptr), "l"(&reinterpret_cast<const int4 *>(A)[_i * k + _k]));
     }
-    
-    __asm__ __volatile__("cp.async.commit_group;");
-    // set 1 (or more) if you want to do staged pipeline
-    __asm__ __volatile__("cp.async.wait_group 0;");
+    using fetch_elem_t = cute::uint128_t;
+    using elem_t = cute::bfloat16_t;
+    constexpr int nelem_per_fetch = sizeof(fetch_elem_t) / sizeof(elem_t);
+    constexpr int nthreads_per_row = kBlockK / nelem_per_fetch;
+    // Now assume K Major (switch accordingly for m/n major)
+    // In a single fetch iteration (window), a CTA 
+    // can fetch nthreads (blockDim) * nelem_per_fetch elements.
+    // A single fetch window should align to the major dimension first, to 
+    // do continuous fetching.
+    auto tiled_copy_a = cute::make_tiled_copy(
+        cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEGLOBAL<fetch_elem_t>, elem_t>{},
+        cute::Layout<cute::Shape<cute::Int<kNThreads / nthreads_per_row>, cute::Int<nthreads_per_row>>>{},
+        cute::Layout<cute::Shape<cute::_1, cute::Int<nelem_per_fetch>>>{}
+    );
+
+    using sALayout = decltype(cute::tile_to_shape(
+        cute::SM90::GMMA::Layout_K_INTER_Atom<elem_t>{},
+        cute::Shape<cute::Int<kBlockM>, cute::Int<kBlockK>>{}
+    ));
+    auto _sA = cute::make_tensor(
+        cute::make_smem_ptr(reinterpret_cast<elem_t*>(sA)), sALayout{}
+    );
+    auto thr_copy_a = tiled_copy_a.get_slice(tid);
+    auto tAsA = thr_copy_a.partition_S(_sA);
+    cute::cp_async_fence();
+    cute::cp_async_wait<0>();
 #elif CP_VER == 4
     // Warning: You should also read for cluster "empty" barrier for "consumer" synchronization for new loading available.
     __shared__ uint64_t producer_barrier_handle;
@@ -189,7 +217,7 @@ void gemm_cp_tma_bf16_krnl(size_t m, size_t n, size_t k, float *C , const __nv_b
 #if CP_VER == 0
         acc += __bfloat162float(A[i * k + _k] * B[j * k + _k]);
 #else
-        acc += __bfloat162float(sA[i * 16 + _k] * B[j * k + _k]);
+        acc += __bfloat162float(sA[i * kBlockK + _k] * B[j * k + _k]);
 #endif
     }
     C[i * n + j] = acc;
@@ -221,7 +249,7 @@ int main(int argc, char **argv) {
 
     float *A_h, *A_d, *B_h, *B_d, *C1_h, *C2_h, *C1_d, *C2_d;
     __nv_bfloat16 *A_d1, *B_d1;
-    constexpr int M = 48, N = 32, K = 16;
+    constexpr int M = 128, N = 128, K = 64;
     A_h = new float[M * K]; B_h = new float[N * K]; C1_h = new float[M * N]; C2_h = new float[M * N]; 
     fill_rand(A_h, M * K);
     fill_rand(B_h, N * K);
