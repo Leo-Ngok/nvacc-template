@@ -17,6 +17,7 @@ struct verbs_host_context {
   ibv_context *ib_ctx = nullptr;
   ibv_pd *ib_pd = nullptr;
 
+  ibv_srq *srq;
   ibv_cq *cq;
   std::vector<ibv_qp *> peer_qp;
 

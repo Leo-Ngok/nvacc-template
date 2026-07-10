@@ -11,8 +11,7 @@
 #include <doca_verbs.h>
 #include <infiniband/verbs.h>
 
-bool cleanup_pd = false;
-bool cleanup_mr = false;
+constexpr doca_gpu_dev_verbs_nic_handler nic_handler = DOCA_GPUNETIO_VERBS_NIC_HANDLER_CPU_PROXY;
 
 struct verbs_dev_context {
   size_t rank;
@@ -44,6 +43,9 @@ struct verbs_dev_context {
   bool has_cleanup = false;
   // exit only context cleared
   bool cleanup_completed = false;
+  // 
+  pthread_t proxy_tid = -1;
+  bool cpu_proxy_quit = false;
 };
 
 verbs_dev_context ctx;
@@ -56,12 +58,19 @@ static doca_gpu_verbs_qp_hl *create_qp(void) {
       .ibpd = ctx.ib_pd,
       .sq_nwqe =
           2048, // TODO: BAD PRACTICE TO HARDWIRE IT, MAKE IT PORTABLE !!!
-      .nic_handler = DOCA_GPUNETIO_VERBS_NIC_HANDLER_CPU_PROXY,
+      .nic_handler = nic_handler,
       .mreg_type = DOCA_GPUNETIO_VERBS_MEM_REG_TYPE_DEFAULT,
       .send_dbr_mode_ext = DOCA_GPUNETIO_VERBS_SEND_DBR_MODE_EXT_VALID_DBR,
       .cq_collapsed = false, // may have to set it to true for latency
   };
   DOCA_CHECK(doca_gpu_verbs_create_qp_hl(&qp_init, &qp));
+
+  // auto status = cudaHostRegister(
+  //           qp->qp_gverbs->sq_db, 8,
+  //           cudaHostRegisterPortable | cudaHostRegisterMapped | cudaHostRegisterIoMemory);
+  // if (status != 0) {
+  //   fprintf(stderr, "[RANK %lu] Host Register BlueFlame Doorbell got %d\n", ctx.rank, status);
+  // }
   return qp;
 }
 
@@ -98,14 +107,11 @@ static void connect_qp(doca_verbs_qp *qp, uint16_t dlid, uint32_t dst_qpn) {
   DOCA_CHECK(doca_verbs_qp_attr_set_rq_psn(verbs_qp_attr, 0));
   DOCA_CHECK(doca_verbs_qp_attr_set_dest_qp_num(verbs_qp_attr, dst_qpn));
   // pack infiniband lid here.
-  // Wrong: attach the AH object only after all AH fields are populated. If the
-  // setter snapshots the object, attaching it here captures the default AH.
-  // DOCA_CHECK(doca_verbs_qp_attr_set_ah_attr(verbs_qp_attr, verbs_ah_attr));
+  DOCA_CHECK(doca_verbs_qp_attr_set_ah_attr(verbs_qp_attr, verbs_ah_attr));
   /*-->*/ DOCA_CHECK(doca_verbs_ah_attr_set_dlid(verbs_ah_attr, dlid));
   /*-->*/ DOCA_CHECK(doca_verbs_ah_attr_set_addr_type(
       verbs_ah_attr, DOCA_VERBS_ADDR_TYPE_IB_NO_GRH));
   /*-->*/ DOCA_CHECK(doca_verbs_ah_attr_set_sl(verbs_ah_attr, 0));
-  DOCA_CHECK(doca_verbs_qp_attr_set_ah_attr(verbs_qp_attr, verbs_ah_attr));
   // Max Dest RD Atomic ??
   // doca_verbs_qp_attr_set_max_dest_rd_atomic(verbs_qp_attr, 1);
   DOCA_CHECK(doca_verbs_qp_attr_set_min_rnr_timer(verbs_qp_attr, 1));
@@ -131,11 +137,25 @@ mandatory in RDMA Core (verbs) */
       qp, verbs_qp_attr,
       DOCA_VERBS_QP_ATTR_NEXT_STATE | DOCA_VERBS_QP_ATTR_SQ_PSN |
           DOCA_VERBS_QP_ATTR_ACK_TIMEOUT | DOCA_VERBS_QP_ATTR_RETRY_CNT |
-          DOCA_VERBS_QP_ATTR_RNR_RETRY /*|
-DOCA_VERBS_QP_ATTR_MAX_QP_RD_ATOMIC*/
+          DOCA_VERBS_QP_ATTR_RNR_RETRY /*| DOCA_VERBS_QP_ATTR_MAX_QP_RD_ATOMIC*/
       ));
   DOCA_CHECK(doca_verbs_ah_attr_destroy(verbs_ah_attr));
   DOCA_CHECK(doca_verbs_qp_attr_destroy(verbs_qp_attr));
+}
+
+
+static void *progress_cpu_proxy(void *) {
+  // bool *quit = reinterpret_cast<bool *>(args_);
+    printf("Thread CPU proxy progress is running... %ld\n",
+           (long)*((volatile bool *)&ctx.cpu_proxy_quit));
+    size_t curr_rank = ctx.rank;
+    while (!*((volatile bool *)&ctx.cpu_proxy_quit)) {
+      curr_rank = (curr_rank + 1) % ctx.world_size;
+      if (curr_rank == ctx.rank) continue;
+      doca_gpu_verbs_cpu_proxy_progress(ctx.peer_qp[curr_rank]->qp_gverbs, nullptr);
+    }
+
+    return nullptr;
 }
 
 // you are supposed to create one app instance per node only!!
@@ -165,32 +185,21 @@ void build(int argc, char **argv) {
   ctx.ib_pd = ibv_alloc_pd(ctx.ib_ctx);
   // Put Queue Pair and Completion Queue on GPU VRAM buffer, not on CPU RAM
   // 3. Create Queue Pair
-  doca_gpu_verbs_qp_init_attr_hl qp_init = {
-      .gpu_dev = ctx.doca_ctx,
-      .ibpd = ctx.ib_pd,
-      .sq_nwqe =
-          2048, // TODO: BAD PRACTICE TO HARDWIRE IT, MAKE IT PORTABLE !!!
-      .nic_handler = DOCA_GPUNETIO_VERBS_NIC_HANDLER_CPU_PROXY,
-      .mreg_type = DOCA_GPUNETIO_VERBS_MEM_REG_TYPE_DEFAULT,
-      .send_dbr_mode_ext = DOCA_GPUNETIO_VERBS_SEND_DBR_MODE_EXT_VALID_DBR,
-      .cq_collapsed = false, // may have to set it to true for latency
-  };
-
-  // 1. Get LID (from port attr), will be sent to peer to choose qp for remote
-  // do work on.
-  // 2. Get Queue Pair number for remote to choose.
-  uint32_t *lids = new uint32_t[size];
   uint32_t *local_qpn = new uint32_t[size];
-  uint32_t *remote_qpn = new uint32_t[size];
-  ibv_port_attr port_attr;
-  ibv_query_port(ctx.ib_ctx, 1, &port_attr);
   ctx.peer_qp.resize(size);
   for (size_t r = 0; r < size; r++) {
     if (r == rank)
       continue;
-    DOCA_CHECK(doca_gpu_verbs_create_qp_hl(&qp_init, &ctx.peer_qp[r]));
+    ctx.peer_qp[r] = create_qp();
     local_qpn[r] = doca_verbs_qp_get_qpn(ctx.peer_qp[r]->qp);
   }
+  // 1. Get LID (from port attr), will be sent to peer to choose qp for remote
+  // do work on.
+  // 2. Get Queue Pair number for remote to choose.
+  uint32_t *lids = new uint32_t[size];
+  uint32_t *remote_qpn = new uint32_t[size];
+  ibv_port_attr port_attr;
+  ibv_query_port(ctx.ib_ctx, 1, &port_attr);
 
   MPI_CHECK(MPI_Allgather(&port_attr.lid, 1, MPI_UINT32_T, lids, 1,
                           MPI_UINT32_T, MPI_COMM_WORLD));
@@ -210,17 +219,41 @@ void build(int argc, char **argv) {
 
   ctx.pgsz = sysconf(_SC_PAGESIZE);
   CUdevice devh;
-  CUDA_CHECK(cuDeviceGet(&devh, 0));
+  // CUDA_CHECK(cuDeviceGet(&devh, 0));
+  CUDA_CHECK(cuCtxGetDevice(&devh));
   int has_support;
   CUDA_CHECK(cuDeviceGetAttribute(&has_support,
                                   CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED, devh));
   ctx.dmabuf_supported = (has_support == 1);
+  if (has_support) {
+    printf("[INFO] DMA Buffer backend will be used for memory allocation.\n");
+  }
+  if (access("/sys/kernel/mm/memory_peers/nv_mem/version", F_OK) == 0) {
+    printf("[INFO] Peermem backend will be used for memory allocation, it is found in nv_mem.\n");
+        ctx.peermem_supported = true;
+  }
+  if (access("/sys/kernel/mm/memory_peers/nvidia-peermem/version", F_OK) == 0) {
+    printf("[INFO] Peermem backend will be used for memory allocation, it is found in nvidia-peermem.\n");
+        ctx.peermem_supported = true;
+  }
+  if (access("/sys/module/nvidia_peermem/version", F_OK) == 0) {
+    printf("[INFO] Peermem backend will be used for memory allocation, it is found in nvidia_peermem.\n");
+        ctx.peermem_supported = true;
+  }
+  if constexpr (nic_handler == DOCA_GPUNETIO_VERBS_NIC_HANDLER_CPU_PROXY) {
+    pthread_create(
+        &ctx.proxy_tid, nullptr, progress_cpu_proxy, nullptr
+    );
+  }
 }
 void cleanup(void) {
   if (ctx.has_cleanup)
     return;
   ctx.has_cleanup = true;
-
+  if constexpr (nic_handler == DOCA_GPUNETIO_VERBS_NIC_HANDLER_CPU_PROXY) {
+    *((volatile bool *)&ctx.cpu_proxy_quit) = true;
+    pthread_join(ctx.proxy_tid, nullptr);
+  }
   for (int r = 0; r < ctx.world_size; r++) {
     if (r == ctx.rank)
       continue;
@@ -240,6 +273,10 @@ void cleanup(void) {
 
 buffer_dev_handle::buffer_dev_handle(size_t _bufsz) {
   bufsz = _bufsz;
+  if (!ctx.dmabuf_supported && !ctx.peermem_supported) {
+    fprintf(stderr, "NONE of DMABUF or Peermem supported, your buffer from buffer_dev_handle with size %lu is corrupt, DO NOT use it!\n", _bufsz);
+    return;
+  }
   DOCA_CHECK(doca_gpu_mem_alloc(ctx.doca_ctx, _bufsz, ctx.pgsz,
                                 DOCA_GPU_MEM_TYPE_GPU, &buf, nullptr));
   CUDART_CHECK(cudaMemset(buf, 0, bufsz));
