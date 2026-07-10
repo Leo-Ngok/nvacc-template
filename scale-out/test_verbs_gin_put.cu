@@ -3,19 +3,21 @@
 #include <cstdint>
 #include <device/doca_gpunetio_dev_verbs_qp.cuh>
 #include <doca_gpunetio.h>
+#include <doca_gpunetio_dev_verbs_onesided.cuh>
 #include <doca_gpunetio_verbs_def.h>
 #include <endian.h>
 #include <immintrin.h>
 #include <infiniband/mlx5dv.h>
 #include <stddef.h>
-#include <doca_gpunetio_dev_verbs_onesided.cuh>
 /*
 nvcc test_verbs_gin_put.cu verbs_dev.cc -o test_verbs_gin_put \
 -gencode=arch=compute_80,code=sm_80 -Xcompiler -msse4.2 \
 -std=c++20 -O3 \
 -I$(mpicxx -showme:incdirs) -L$(mpicxx -showme:libdirs) \
--L/home/fit/zhaijdyzq/spack/opt/spack/linux-broadwell/pmix-6.0.0-dqzkwte3b5sotgatuiiqn6au6nj5bjut/lib \
--L/home/fit/zhaijdyzq/spack/opt/spack/linux-broadwell/prrte-4.0.0-wa3gvjktvvcglz7tq6vbqyttcnlblks3/lib \
+-L/home/fit/zhaijdyzq/spack/opt/spack/linux-broadwell/pmix-6.0.0-dqzkwte3b5sotgatuiiqn6au6nj5bjut/lib
+\
+-L/home/fit/zhaijdyzq/spack/opt/spack/linux-broadwell/prrte-4.0.0-wa3gvjktvvcglz7tq6vbqyttcnlblks3/lib
+\
 -I/home/fit/zhaijdyzq/repos/gpunetio/include \
 -I/home/fit/zhaijdyzq/repos/gpunetio/include/host \
 -I/home/fit/zhaijdyzq/repos/gpunetio/include/device \
@@ -26,8 +28,9 @@ nvcc test_verbs_gin_put.cu verbs_dev.cc -o test_verbs_gin_put \
 
 //  export
 //  LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/home/fit/zhaijdyzq/repos/gpunetio/lib
-/* 
-salloc -p a01 -N4 -n4 --gres=gpu:1 mpirun --mca btl_tcp_if_include ens14f0 -np 4 ./test_verbs_gin_put
+/*
+salloc -p a01 -N4 -n4 --gres=gpu:1 mpirun --mca btl_tcp_if_include ens14f0 -np 4
+./test_verbs_gin_put
 */
 uint32_t auto_crc32(const void *__restrict buf, size_t len) {
   const uint8_t *current = (const uint8_t *)buf;
@@ -50,45 +53,49 @@ uint32_t auto_crc32(const void *__restrict buf, size_t len) {
   return ~crc;
 }
 template <enum doca_gpu_dev_verbs_exec_scope scope>
-__global__ void put_bw(struct doca_gpu_dev_verbs_qp *qp, uint32_t num_iters, uint32_t data_size,
-                       uint8_t *src_buf, uint32_t src_buf_mkey, uint8_t *dst_buf,
+__global__ void put_bw(struct doca_gpu_dev_verbs_qp *qp, uint32_t num_iters,
+                       uint32_t data_size, uint8_t *src_buf,
+                       uint32_t src_buf_mkey, uint8_t *dst_buf,
                        uint32_t dst_buf_mkey) {
-    doca_gpu_dev_verbs_ticket_t out_ticket;
-    uint32_t lane_idx = doca_gpu_dev_verbs_get_lane_id();
-    uint32_t tidx = threadIdx.x + (blockIdx.x * blockDim.x);
+  doca_gpu_dev_verbs_ticket_t out_ticket;
+  uint32_t lane_idx = doca_gpu_dev_verbs_get_lane_id();
+  uint32_t tidx = threadIdx.x + (blockIdx.x * blockDim.x);
 
-    for (uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < num_iters;
-         idx += (blockDim.x * gridDim.x)) {
+  for (uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < num_iters;
+       idx += (blockDim.x * gridDim.x)) {
 
-        doca_gpu_dev_verbs_put<DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU,
-                               DOCA_GPUNETIO_VERBS_NIC_HANDLER_AUTO, scope>(
-            qp,
-            doca_gpu_dev_verbs_addr{.addr = (uint64_t)(dst_buf + (data_size * tidx)),
-                                    .key = (uint32_t)dst_buf_mkey},
-            doca_gpu_dev_verbs_addr{.addr = (uint64_t)(src_buf + (data_size * tidx)),
-                                    .key = (uint32_t)src_buf_mkey},
-            data_size, &out_ticket);
+    doca_gpu_dev_verbs_put<DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU,
+                           DOCA_GPUNETIO_VERBS_NIC_HANDLER_AUTO, scope>(
+        qp,
+        doca_gpu_dev_verbs_addr{.addr =
+                                    (uint64_t)(dst_buf + (data_size * tidx)),
+                                .key = (uint32_t)dst_buf_mkey},
+        doca_gpu_dev_verbs_addr{.addr =
+                                    (uint64_t)(src_buf + (data_size * tidx)),
+                                .key = (uint32_t)src_buf_mkey},
+        data_size, &out_ticket);
 
-        if (scope == DOCA_GPUNETIO_VERBS_EXEC_SCOPE_THREAD) {
-            if (doca_gpu_dev_verbs_poll_cq_at<DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU>(
-                    doca_gpu_dev_verbs_qp_get_cq_sq(qp), out_ticket) != 0)
-                printf("Error CQE!\n");
-        }
-
-        if (scope == DOCA_GPUNETIO_VERBS_EXEC_SCOPE_WARP) {
-            if (lane_idx == 0) {
-                if (doca_gpu_dev_verbs_poll_cq_at(doca_gpu_dev_verbs_qp_get_cq_sq(qp),
-                                                  out_ticket) != 0)
-                    printf("Error CQE!\n");
-            }
-        }
-
-        __syncthreads();
+    if (scope == DOCA_GPUNETIO_VERBS_EXEC_SCOPE_THREAD) {
+      if (doca_gpu_dev_verbs_poll_cq_at<
+              DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU>(
+              doca_gpu_dev_verbs_qp_get_cq_sq(qp), out_ticket) != 0)
+        printf("Error CQE!\n");
     }
+
+    if (scope == DOCA_GPUNETIO_VERBS_EXEC_SCOPE_WARP) {
+      if (lane_idx == 0) {
+        if (doca_gpu_dev_verbs_poll_cq_at(doca_gpu_dev_verbs_qp_get_cq_sq(qp),
+                                          out_ticket) != 0)
+          printf("Error CQE!\n");
+      }
+    }
+
+    __syncthreads();
+  }
 }
 
-
-void launch_put(buffer_dev_handle *bufh, size_t my_rank, size_t world_size, doca_gpu_dev_verbs_exec_scope scope) {
+void launch_put(buffer_dev_handle *bufh, size_t my_rank, size_t world_size,
+                doca_gpu_dev_verbs_exec_scope scope) {
   auto peer_rank = (my_rank + 1) % world_size;
   cudaStream_t stream = 0; // default stream
   auto qp = get_peer_qp(peer_rank);
@@ -104,13 +111,21 @@ void launch_put(buffer_dev_handle *bufh, size_t my_rank, size_t world_size, doca
   // 1
   auto src_buf_mkey = htobe32(bufh->lkey);
   auto dst_buf_mkey = htobe32(bufh->rkey[peer_rank]);
-  void (*fn)(doca_gpu_dev_verbs_qp *, uint32_t, uint32_t, uint8_t *, uint32_t, uint8_t *, uint32_t) = nullptr;
+  void (*fn)(doca_gpu_dev_verbs_qp *, uint32_t, uint32_t, uint8_t *, uint32_t,
+             uint8_t *, uint32_t) = nullptr;
   switch (scope) {
-  case DOCA_GPUNETIO_VERBS_EXEC_SCOPE_THREAD: fn = put_bw<DOCA_GPUNETIO_VERBS_EXEC_SCOPE_THREAD>; break;
-  case DOCA_GPUNETIO_VERBS_EXEC_SCOPE_WARP: fn = put_bw<DOCA_GPUNETIO_VERBS_EXEC_SCOPE_WARP>; break;
+  case DOCA_GPUNETIO_VERBS_EXEC_SCOPE_THREAD:
+    fn = put_bw<DOCA_GPUNETIO_VERBS_EXEC_SCOPE_THREAD>;
+    break;
+  case DOCA_GPUNETIO_VERBS_EXEC_SCOPE_WARP:
+    fn = put_bw<DOCA_GPUNETIO_VERBS_EXEC_SCOPE_WARP>;
+    break;
   }
-  printf("[RANK %lu] now launch kernel with scope %s\n", my_rank, (scope == DOCA_GPUNETIO_VERBS_EXEC_SCOPE_THREAD) ? "thread" : "warp");
-  fn<<<cuda_blocks, cuda_threads, 0, stream>>>(qp_gpu, num_iters, data_size, src_buf, src_buf_mkey, dst_buf, dst_buf_mkey);
+  printf("[RANK %lu] now launch kernel with scope %s\n", my_rank,
+         (scope == DOCA_GPUNETIO_VERBS_EXEC_SCOPE_THREAD) ? "thread" : "warp");
+  fn<<<cuda_blocks, cuda_threads, 0, stream>>>(qp_gpu, num_iters, data_size,
+                                               src_buf, src_buf_mkey, dst_buf,
+                                               dst_buf_mkey);
   CUDART_CHECK(cudaGetLastError());
   CUDART_CHECK(cudaStreamSynchronize(stream));
 }
@@ -130,7 +145,8 @@ int main(int argc, char **argv) {
   }
   CUDART_CHECK(
       cudaMemcpy(bufh->buf, tbuf_h, nbuf_bytes, cudaMemcpyHostToDevice));
-  launch_put(bufh, rk, sz, (doca_gpu_dev_verbs_exec_scope)(argc > 1 ? atoi(argv[1]) : 0));
+  launch_put(bufh, rk, sz,
+             (doca_gpu_dev_verbs_exec_scope)(argc > 1 ? atoi(argv[1]) : 0));
   auto local_crc = auto_crc32(tbuf_h, nbuf_bytes);
   uint32_t *ring_crc = new uint32_t[sz];
   MPI_CHECK(MPI_Allgather(&local_crc, 1, MPI_UINT32_T, ring_crc, 1,

@@ -32,7 +32,7 @@ NOTE: One may consider to extract the part for loading operands to (registers fo
 This part contains gpu memory management in the same compute node via the following mechanisms:
 
 - Inter-Process Communication (IPC) handles. Forward static (pinned) memory across different processes via IPC Memory handles.
-- Virtual Memory Management (VMM) handles. The examples shares the handles via **POSIX file descriptors** (by SCM control with UNIX Socket). You may also try sharing via Fabric mode, if you wish and you have IMEX manager installed.
+- Virtual Memory Management (VMM) handles. The examples shares the handles via **POSIX file descriptors** (by SCM control with UNIX Socket). You may also try sharing via Fabric mode, if you wish and you have IMEX manager installed. The latter is for supernode machines, e.g. NVL72, NVL576.
 - VMM Multicast (MC) handles. Examples use the MC handles to do all reduce and broadcast operations via `multimem` instructions, which leverages NVLink SHARP (Scalable Hierarchical Aggrregation and Reduction Protocol) mechanisms.
 
 For the VMM way, one can think of a VMM handle as the physical *page frame number*, and one writes the PTE page number and access level.
@@ -89,6 +89,16 @@ One do **NOT** actually write work queue element (WQE) directly. Instead, one de
 
 You use the HCA context to create PD and CQ. Inside the PD, you create QP. When a new heap memory is allocated, and you want that part to be transmitted, you do `ibv_reg_mr` with the PD to register that buffer as a MR in the PD. A MR actually boils down to `lkey` and `rkey`. Local key is used when a HCA access local memory, and remote key for transmitting to remote HCA to access remote memory.
 
+The following assumes an Infiniband environment, without global routing.
+
+In particular, one may consider the following for the equivalent manner:
+
+- Create queue pairs: `create_qp()`, gives you a queue pair handle. One may treat the queue pair number (`qpn`) as the port of a connection. This is compared to `socket()`
+- Take the `lid` of the local HCA. One may consider this as the MAC address of a NIC.
+- Exchange `lid` and `qpn` through ethernet.
+- With the `dlid` and `qpn` received, `connect_qp()`, which is equivalent to `connect()` for BSD API.
+ - It is a process of state transition of QP: RST->INIT->RTR->RTS 
+
 ### GPU Direct RDMA
 
 The above is CPU Memory Direct RDMA. If instead, GPU Direct RDMA is needed, then just replace the CPU pointer as GPU device pointer when doing `ibv_reg_mr`.
@@ -97,7 +107,7 @@ But before doing that, make sure that IOMMU or VT-d is disabled, or else the tra
 
 ### Direct Verbs
 
-One may refer to the DevX API from Mellanox.
+One may refer to the DevX API from Mellanox. However, due to legacy standard of ISO C, DevX API uses a lot of bit aligning struct, which is difficult for a linter to analyze.
 
 Before diving into this part, let's think of the possible implementation of the ibv objects.
 
@@ -113,6 +123,31 @@ To achieve DMA to the HCA, one can get a DMABUF file descriptor of the buffer, a
 
 If one instead export the DMABUF fd of a GPU buffer, one can fill the WQE on GPU. Then, CPU only needs to write to doorbell register. If the doorbell is also mapped to GPU virtual memory, one can fully bypass the host memory and invoke RDMA operations on GPU entirely. 
 
+### GPU controlled RDMA
+
+GPU Direct RDMA moves the data plane out of CPU's DRAM. However, the control plane is still there.
+
+If there is a lot of scattered write to the remote, then the control plane becomes significant.
+
+Hence, one may want to put also the `WQ`, especially the `SQ` and `CQ` onto GPU's VRAM.
+
+Doing so needs the support of `DMABUF` or `nvidia-peermem`. If it is supported, the CUDA driver can export the handle of an allocated GPU buffer to HCA, and let the HCA access the GPU VRAM directly via PCIe bus and PCIe switches.
+
+If one also wants to map the doorbell, i.e. the MMIO BlueFlame UAR (User Accessible Register) to the GPU's virtual address space, then the following should be set in the configuration of the GPU kernel driver module:
+
+```plain
+> cat /etc/modprobe.d/nvidia.conf
+NVreg_EnableStreamMemOPs=1 NVreg_RegistryDwords="PeerMappingOverride=1;
+```
+
+Or else, for each QP, one may allocate a proxy buffer on CPU's DRAM via `cudaHostRegister` and `cudaHostGetDevicePointer`, then let GPU to update the SQ's producer index, after the SQ being updated.
+
+However, this means it may possibly result in contention in PCIe bus, as it needs to CAS the producer index across CTA and threads.
+
+To further mitigate this issue, one may use GDRCopy. Then CPU proxy invokes `copy_from_mapping` to fetch this 8-byte pi, and compares with its own, then (writes to Doorbell Record first for HCA older than CX8, CX8 and CX9 do not need it as they have reliable doorbell) and writes to the doorbell MMIO register.
+
+To use GDRCopy, one may have to assert that the `gdrdrv` kernel driver being installed, by examining the file `/dev/gdrdrv`.
+
 ### Examples
 
 IB verbs:
@@ -121,8 +156,10 @@ IB verbs:
 - osu_bw like bandwidth test
 
 GPU Direct RDMA
-- One sided write to / from gpu memory
+- One sided write to / from gpu memory, launched by CPU.
 
-Direct Verbs [TODO]
-- Export DMABUF on CPU memory and allocate `mlx5dv` objects.
-- Export DMABUF on GPU memory.
+Direct Verbs
+- DO NOT try it. It is merely "Hardware Engineering"
+
+GPU controlled RDMA
+- One sided write to / from gpu memory, mostly launched by GPU (except ring Doorbell)
