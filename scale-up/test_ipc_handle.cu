@@ -1,7 +1,7 @@
 //SPDX-License-Identifier: GPL-2.0
 
 /*
-nvcc test_ipc_handle.cu -o test_ipc_handle \
+nvcc test_ipc_handle.cu mem_handle_ipc.cc -o test_ipc_handle \
 -std=c++20 -O3 \
 -I$(mpicxx -showme:incdirs) \
 -L$(mpicxx -showme:libdirs) \
@@ -18,24 +18,7 @@ nvcc test_ipc_handle.cu -o test_ipc_handle \
 #include <stdio.h>
 #include <tuple>
 #include <cassert>
-
-#define MPI_CHECK(status) \
-    do {\
-        int ss = (status); \
-        if(ss != MPI_SUCCESS) { \
-            fprintf(stderr, "MPI Error occured in " __FILE__ " line %d (" #status ") with code %d\n", __LINE__,  ss); \
-            MPI_Abort(MPI_COMM_WORLD, ss); \
-        } \
-    } while(0)
-
-#define CUDART_CHECK(status) \
-    do {\
-        cudaError_t ss = (status); \
-        if(ss != cudaSuccess) {\
-            fprintf(stderr, "CUDA RUNTIME API Error occured in " __FILE__ " line %d (" #status ") with code %d\n", __LINE__, ss); \
-            MPI_Abort(MPI_COMM_WORLD, ss); \
-        }\
-    } while(0)
+#include "mem_handle.hh"
 
 auto mpi_start(int argc, char **argv) {
     MPI_CHECK(MPI_Init(&argc, &argv));
@@ -47,45 +30,39 @@ auto mpi_start(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
-    auto [rank, size] = mpi_start(argc, argv);
-    char *buf_loc_d;
-    char *buf_remote_d;
-    
+    auto [rank, size] = mpi_start(argc, argv);    
     int num_devices;
     CUDART_CHECK(cudaGetDeviceCount(&num_devices));
     assert(num_devices == size);
     auto peer = (rank + 1) % size;
-    cudaSetDevice(rank);
-    
-    // CudaMallocHost(&buf_loc_h, 20);
-    MPI_Barrier(MPI_COMM_WORLD);
-    CUDART_CHECK(cudaMalloc(&buf_loc_d, 40));
-    cudaIpcMemHandle_t buf_handle, buf_remote_handle;
-    CUDART_CHECK(cudaIpcGetMemHandle(&buf_handle, buf_loc_d));
-    MPI_CHECK(MPI_Sendrecv(
-        buf_handle.reserved,        sizeof(buf_handle.reserved),        MPI_CHAR, peer, 0, 
-        buf_remote_handle.reserved, sizeof(buf_remote_handle.reserved), MPI_CHAR, peer, 0, 
-        MPI_COMM_WORLD, MPI_STATUS_IGNORE));
-
-    CUDART_CHECK(cudaIpcOpenMemHandle(reinterpret_cast<void **>(&buf_remote_d), buf_remote_handle, 
-    cudaIpcMemLazyEnablePeerAccess));
-
-
-    
-
-    char buf_loc_h[40], buf_remote_h[40];
-    sprintf(buf_loc_h, "Shared buffer from rank %d\n", rank);
-    CUDART_CHECK(cudaMemcpy(buf_loc_d, buf_loc_h, 40, cudaMemcpyHostToDevice));
-    CUDART_CHECK(cudaDeviceSynchronize());
+    CUDART_CHECK(cudaSetDevice(rank));
     MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
 
-    CUDART_CHECK(cudaMemcpy(buf_remote_h, buf_remote_d, 40, cudaMemcpyDeviceToHost));
+
+    auto ipc_handle = new IpcMemHandle();
+    ipc_handle->malloc(100);
+
+    char buf_loc_h[50], buf_remote_h[50];
+    snprintf(buf_loc_h, sizeof(buf_loc_h), "[2ND] IPC LOCAL WRITE (= %d)", rank);
+    snprintf(buf_remote_h, sizeof(buf_remote_h), "[1 ST] IPC REMOTE WRITE (%d -> %d)", rank, peer);
+
+    CUDART_CHECK(cudaMemcpy((char *)ipc_handle->getBaseLocal() + 50, buf_loc_h, sizeof(buf_loc_h), cudaMemcpyHostToDevice));
+    CUDART_CHECK(cudaMemcpy(ipc_handle->getBasePeer(peer), buf_remote_h, sizeof(buf_remote_h), cudaMemcpyHostToDevice));
+    
     CUDART_CHECK(cudaDeviceSynchronize());
-    printf("Rank %d receives: %s", rank, buf_remote_h);
+    MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+    
+    memset(buf_loc_h, 0, sizeof(buf_loc_h));
+    memset(buf_remote_h, 0, sizeof(buf_remote_h));
+    
+    CUDART_CHECK(cudaMemcpy(buf_remote_h, (char *)ipc_handle->getBasePeer(peer) + 50, sizeof(buf_remote_h), cudaMemcpyDeviceToHost));
+    CUDART_CHECK(cudaMemcpy(buf_loc_h, ipc_handle->getBaseLocal(), sizeof(buf_loc_h), cudaMemcpyDeviceToHost));
+    printf("[RANK %d] Buffer is now (1 SELF): %s, (2 NEXT): %s\n", rank, buf_loc_h, buf_remote_h);
+
     MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
 
-    CUDART_CHECK(cudaIpcCloseMemHandle(buf_remote_d));
-    CUDART_CHECK(cudaFree(buf_loc_d));
+    ipc_handle->discard();
+    delete ipc_handle;
     MPI_CHECK(MPI_Finalize());
     return 0;
 }
