@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cuda_runtime.h>
 #include <cfloat>
+#include <cstdint>
 
 #define CUDART_CHECK(status) \
     do {\

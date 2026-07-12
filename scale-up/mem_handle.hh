@@ -49,10 +49,10 @@ public:
     void malloc(size_t sz);
     void discard(void);
     inline void *getBaseLocal(void) const {
-        return buf_;
+        return reinterpret_cast<void *>(buf_alt_);
     }
     inline void *getBasePeer(size_t rank) const {
-        return rbuf_[rank];
+        return reinterpret_cast<void *>(rbuf_alt_[rank]);
     }
     inline CUdeviceptr getAPIBaseLocal(void) const {
         return buf_alt_;
@@ -65,7 +65,7 @@ public:
         if (!mc_enabled_) {
             fprintf(stderr, "Accessing Multicast Pointer without MC enabled.\n");
         }
-        return mcbuf_;
+        return reinterpret_cast<void *>(mcbuf_alt_);
     }
     inline CUdeviceptr getAPIBaseMC(void) const {
         if (!mc_enabled_) {
@@ -90,13 +90,13 @@ private:
     };
     CUdeviceptr mapHandle(const CUmemGenericAllocationHandle mhandle) const;
     void discardHandle(CUmemGenericAllocationHandle mhandle, CUdeviceptr ptr_d) const;
+    
+    void allGatherHandles(CUmemGenericAllocationHandle src_handle, CUmemGenericAllocationHandle *trg_handles) const;
+    void bcastHandles(CUmemGenericAllocationHandle &mhandle, int src_rank) const;
     void populateAndSendHandle(CUmemGenericAllocationHandle mhandle) const;
     void recvHandles(RecvHandlesCtx &ctx) const;
-    void recvHandlesResolvePeer(RecvHandlesCtx &ctx);
-    void recvHandlesResolveMC(RecvHandlesCtx &ctx);
-    void *buf_ = nullptr;
+    void recvHandlesResolve(RecvHandlesCtx &ctx, CUmemGenericAllocationHandle *trg_handles) const;
     CUdeviceptr buf_alt_ = 0;
-    void **rbuf_ = nullptr;
     CUdeviceptr *rbuf_alt_ = nullptr;
     size_t bufsz_ = 0;
     int my_rank_; 
@@ -106,7 +106,6 @@ private:
 
     bool mc_enabled_ = false;
     CUmemGenericAllocationHandle mc_handle_;
-    void *mcbuf_ = nullptr;
     CUdeviceptr mcbuf_alt_;
 };
 

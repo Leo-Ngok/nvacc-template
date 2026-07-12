@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cuda_runtime.h>
 #include <cfloat>
+#include <cstdint>
 
 #define CUDART_CHECK(status) \
     do {\
@@ -96,6 +97,7 @@ for i in range(128):
 11. You may want to consider using TMA to load to Smem. Then you may want to use 3D TMA descriptor
 12. This version does NOT consider swizzling. If you want to do so, understand the non-swizzled version first.
 */
+#define sPos(sBuf, BLOCK_i, j) sBuf[smem_pos<>]
 __global__
 void gemm_wgmma_bf16_krnl(size_t m, size_t n, size_t k, float *C , const __nv_bfloat16 *A, __nv_bfloat16 *B) {
     // 64 X 64 X 16

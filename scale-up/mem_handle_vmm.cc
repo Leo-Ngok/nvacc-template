@@ -11,6 +11,8 @@
 #include <thread>
 #include <unistd.h>
 
+constexpr bool kSupernodeSupported = false;
+
 auto round_up(size_t sz, size_t gran) {
   return ((sz + gran - 1) / gran) * gran;
 }
@@ -18,9 +20,6 @@ auto round_up(size_t sz, size_t gran) {
 void VmmMemHandle::malloc(size_t bufsz) {
   MPI_CHECK(MPI_Comm_rank(MPI_COMM_WORLD, &my_rank_));
   MPI_CHECK(MPI_Comm_size(MPI_COMM_WORLD, &world_size_));
-  rbuf_ = new void *[world_size_];
-  std::fill(rbuf_, rbuf_ + world_size_, nullptr);
-
   // cuMem:
 
   // Local Part
@@ -36,37 +35,24 @@ void VmmMemHandle::malloc(size_t bufsz) {
       &gran, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
   bufsz_ = round_up(bufsz, gran);
   CUDA_CHECK(cuMemCreate(&mhandle_, bufsz_, &prop, 0));
-
-  // 2. Address Reserve
-  // 3. Map
-  // 4. Set Access
+  // treat it as mmap ...
   buf_alt_ = mapHandle(mhandle_);
-  buf_ = reinterpret_cast<void *>(buf_alt_);
-  // Exchange local handles ...
-  RecvHandlesCtx exCtx;
-  exCtx.num_handles_ = world_size_ - 1;
-  // Remote Part
 
-  recvHandles(exCtx);
-  MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
-  // 1. Export to sharable handle (fd)
-  // 2. Exchange fd via unix socket
-  populateAndSendHandle(mhandle_);
-  MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
-  // 3. Import from sharable handle to mem handle
-  recvHandlesResolvePeer(exCtx);
+  // Allgather the handles ...
+  rmhandle_ = new CUmemGenericAllocationHandle[world_size_];
+  allGatherHandles(mhandle_, rmhandle_);
+
   // 4. Address Reserve, Map, Set Access
   rbuf_alt_ = new CUdeviceptr[world_size_];
   for (int r = 0; r < world_size_; r++) {
     if (r == my_rank_)
       continue;
     rbuf_alt_[r] = mapHandle(rmhandle_[r]);
-    rbuf_[r] = reinterpret_cast<void *>(rbuf_alt_[r]);
   }
 }
+
 void VmmMemHandle::discard(void) {
   if (mc_enabled_) {
-    
     CUdevice dev_handle;
     CUDA_CHECK(cuDeviceGet(&dev_handle, my_rank_));
     CUDA_CHECK(cuMulticastUnbind(mc_handle_, dev_handle, 0, bufsz_));
@@ -80,7 +66,6 @@ void VmmMemHandle::discard(void) {
   delete[] rmhandle_;
   delete[] rbuf_alt_;
   discardHandle(mhandle_, buf_alt_);
-  delete[] rbuf_;
 }
 
 void VmmMemHandle::populateAndSendHandle(
@@ -174,20 +159,53 @@ void VmmMemHandle::recvHandles(RecvHandlesCtx &ctx) const {
       });
 }
 
-void VmmMemHandle::recvHandlesResolvePeer(RecvHandlesCtx &ctx) {
+void VmmMemHandle::recvHandlesResolve(
+    RecvHandlesCtx &ctx, CUmemGenericAllocationHandle *trg_handles) const {
   ctx.t.join();
-  rmhandle_ = new CUmemGenericAllocationHandle[world_size_];
   auto n = ctx.num_handles_;
   for (int it = 0; it < n; it++) {
     auto fd = ctx.peer_fd_[it];
     auto r = ctx.peer_ranks_[it];
     CUDA_CHECK(cuMemImportFromShareableHandle(
-        &rmhandle_[r], (void *)(uintptr_t)fd,
+        &trg_handles[r], (void *)(uintptr_t)fd,
         CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR));
     KRNL_CHECK(close(fd));
   }
   delete[] ctx.peer_fd_;
   delete[] ctx.peer_ranks_;
+}
+
+void VmmMemHandle::allGatherHandles(
+    CUmemGenericAllocationHandle src_handle,
+    CUmemGenericAllocationHandle *trg_handles) const {
+  if constexpr (kSupernodeSupported) {
+    CUmemFabricHandle fabricHandle;
+    CUDA_CHECK(cuMemExportToShareableHandle(&fabricHandle, src_handle,
+                                            CU_MEM_HANDLE_TYPE_FABRIC, 0));
+    auto peerFabricHandles = new CUmemFabricHandle[world_size_];
+    MPI_CHECK(MPI_Allgather(&fabricHandle, sizeof(CUmemFabricHandle), MPI_BYTE,
+                            peerFabricHandles, sizeof(CUmemFabricHandle),
+                            MPI_BYTE, MPI_COMM_WORLD));
+    for (int r = 0; r < world_size_; r++) {
+      if (r == my_rank_)
+        continue;
+      CUDA_CHECK(cuMemImportFromShareableHandle(
+          &trg_handles[r], &peerFabricHandles[r], CU_MEM_HANDLE_TYPE_FABRIC));
+    }
+    trg_handles[my_rank_] = src_handle;
+    delete[] peerFabricHandles;
+    return;
+  }
+  RecvHandlesCtx exCtx;
+  exCtx.num_handles_ = world_size_ - 1;
+  recvHandles(exCtx);
+  MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+  // 1. Export to sharable handle (fd)
+  // 2. Exchange fd via unix socket
+  populateAndSendHandle(mhandle_);
+  MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+  // 3. Import from sharable handle to mem handle
+  recvHandlesResolve(exCtx, trg_handles);
 }
 
 CUdeviceptr
@@ -210,16 +228,6 @@ void VmmMemHandle::discardHandle(CUmemGenericAllocationHandle mhandle,
 }
 
 void VmmMemHandle::enableMulticast(void) {
-
-  RecvHandlesCtx mcCtx;
-  mcCtx.num_handles_ = 1;
-  // Remote Part
-  if (my_rank_ != 0) {
-    recvHandles(mcCtx);
-  }
-  MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
-  // 1. Export to sharable handle (fd)
-  // 2. Exchange fd via unix socket
   if (my_rank_ == 0) {
     size_t gran;
     CUmulticastObjectProp prop{};
@@ -231,34 +239,47 @@ void VmmMemHandle::enableMulticast(void) {
     // TODO: Make it more portable
     assert(bufsz_ % gran == 0);
     CUDA_CHECK(cuMulticastCreate(&mc_handle_, &prop));
-    populateAndSendHandle(mc_handle_);
   }
-  MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
-  if (my_rank_ != 0) {
-    recvHandlesResolveMC(mcCtx);
-  }
+  bcastHandles(mc_handle_, 0);
   CUdevice dev_handle;
   CUDA_CHECK(cuDeviceGet(&dev_handle, my_rank_));
   CUDA_CHECK(cuMulticastAddDevice(mc_handle_, dev_handle));
   CUDA_CHECK(cuMulticastBindMem(mc_handle_, 0, mhandle_, 0, bufsz_, 0));
   mcbuf_alt_ = mapHandle(mc_handle_);
-  mcbuf_ = reinterpret_cast<void *>(mcbuf_alt_);
   mc_enabled_ = true;
 }
 
-void VmmMemHandle::recvHandlesResolveMC(RecvHandlesCtx &ctx) {
-  ctx.t.join();
-
-  auto n = ctx.num_handles_;
-  assert(n == 1);
-  for (int it = 0; it < n; it++) {
-    auto fd = ctx.peer_fd_[it];
-    auto r = ctx.peer_ranks_[it];
-    CUDA_CHECK(cuMemImportFromShareableHandle(
-        &mc_handle_, (void *)(uintptr_t)fd,
-        CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR));
-    KRNL_CHECK(close(fd));
+void VmmMemHandle::bcastHandles(CUmemGenericAllocationHandle &mhandle,
+                                int src_rank) const {
+  if constexpr (kSupernodeSupported) {
+    CUmemFabricHandle fabricHandle;
+    if (src_rank == my_rank_) {
+      CUDA_CHECK(cuMemExportToShareableHandle(&fabricHandle, mhandle,
+                                              CU_MEM_HANDLE_TYPE_FABRIC, 0));
+    }
+    MPI_CHECK(MPI_Bcast(&fabricHandle, sizeof(CUmemFabricHandle), MPI_BYTE,
+                        src_rank, MPI_COMM_WORLD));
+    if (src_rank != my_rank_) {
+      CUDA_CHECK(cuMemImportFromShareableHandle(&mhandle, &fabricHandle,
+                                                CU_MEM_HANDLE_TYPE_FABRIC));
+    }
+    return;
   }
-  delete[] ctx.peer_fd_;
-  delete[] ctx.peer_ranks_;
+  RecvHandlesCtx mcCtx;
+  mcCtx.num_handles_ = 1;
+  // TODO: Modify the implementation of recvHandlesResolve and remove this assertion.
+  assert(src_rank == 0);
+  if (my_rank_ != src_rank) {
+    recvHandles(mcCtx);
+  }
+  MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+  // 1. Export to sharable handle (fd)
+  // 2. Exchange fd via unix socket
+  if (my_rank_ == src_rank) {
+    populateAndSendHandle(mhandle);
+  }
+  MPI_CHECK(MPI_Barrier(MPI_COMM_WORLD));
+  if (my_rank_ != src_rank) {
+    recvHandlesResolve(mcCtx, &mhandle);
+  }
 }

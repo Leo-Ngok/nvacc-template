@@ -8,6 +8,7 @@
 #include <cuda_runtime.h>
 #include <cfloat>
 #include <cute/tensor.hpp>
+#include <cstdint>
 
 #define CUDART_CHECK(status) \
     do {\

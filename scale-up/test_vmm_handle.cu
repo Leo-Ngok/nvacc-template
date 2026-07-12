@@ -3,10 +3,10 @@
 /*
 nvcc test_vmm_handle.cu mem_handle_vmm.cc -o test_vmm_handle \
 -std=c++20 -O3 \
--I$(mpicxx -showme:incdirs) \
--L$(mpicxx -showme:libdirs) \
--L$(spack location -i /dqz)/lib \
--L$(spack location -i /wa3)/lib \
+-I/home/fit/zhaijdyzq/spack/opt/spack/linux-broadwell/openmpi-5.0.9-3bi2uxl42fzehc5tkenpzvkartxxgwc6/include \
+-L/home/fit/zhaijdyzq/spack/opt/spack/linux-broadwell/openmpi-5.0.9-3bi2uxl42fzehc5tkenpzvkartxxgwc6/lib \
+-L/home/fit/zhaijdyzq/spack/opt/spack/linux-broadwell/pmix-6.0.0-dqzkwte3b5sotgatuiiqn6au6nj5bjut/lib \
+-L/home/fit/zhaijdyzq/spack/opt/spack/linux-broadwell/prrte-4.0.0-wa3gvjktvvcglz7tq6vbqyttcnlblks3/lib \
 -lmpi -lpmix -lprrte -lcuda -lcudart
 */
 // /dqz: pmix intel compiler
