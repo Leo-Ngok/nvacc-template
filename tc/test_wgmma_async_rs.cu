@@ -2,6 +2,8 @@
 
 // nvcc test_wgmma_async_rs.cu -O3 -gencode arch=compute_90a,code=sm_90a -o test_wgmma_async_rs
 // srun -n1 -p h01 --gres=gpu:1 ./test_wgmma_async_rs
+// nvcc test_wgmma_async_rs.cu -O3 -U_GNU_SOURCE -gencode arch=compute_90a,code=sm_90a -o test_wgmma_async_rs
+// srun -n1 --gres=gpu:H100:1 ./test_wgmma_async_rs
 #include <cstdio>
 #include <cuda_bf16.h>
 #include <ctime>
